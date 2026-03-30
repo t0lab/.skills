@@ -1,1 +1,0 @@
-# Databricks Dashboard Skill — Scripts
