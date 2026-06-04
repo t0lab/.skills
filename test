@@ -1,0 +1,573 @@
+"""v2 StreamPart SSE emitter — backend-owned emission for all 9 events.
+
+Consumes a compiled LangGraph's ``astream(stream_mode=[...], subgraphs=True)``
+and re-emits events in the v2 envelope documented at
+``public/mock_deep_agent_sse/README.md``. The envelope shape is::
+
+    {
+      "type": "<mode>",   # messages/partial, values, updates, …
+      "ns":   [...],      # subgraph namespace
+      "data": <payload>,
+      "interrupts": [...] # values events only
+    }
+
+This emitter is the **single emitter** in the system — no agent code
+ever calls ``writer()`` for these envelopes. Tools that want to surface
+a ``custom: search/results`` (or any of the 4 canonical custom subtypes)
+attach the envelope to ``ToolMessage.artifact["custom_events"]``;
+the projector reads the artifact when the corresponding
+``messages/complete`` lands and emits each entry. Nodes that produce
+post-response data (related queries, citations) are watched by
+dedicated backend projectors.
+
+Event mapping (README §4):
+
+- ``stream_mode="messages"`` → ``messages/metadata`` once per new
+  invocation + ``messages/partial`` (AIMessageChunk) /
+  ``messages/complete`` (Tool / Human). AI completes are NOT
+  emitted here — they arrive via the ``updates`` stream per §4.6.
+  After every ``messages/complete`` for a ``ToolMessage``, the
+  projector reads ``artifact["custom_events"]`` and emits each.
+- ``stream_mode="updates"`` → ``updates``. Also runs the related-queries
+  projector.
+- ``stream_mode="values"`` → ``values`` with ``interrupts`` sibling.
+- ``stream_mode="custom"`` → ``custom`` (forward-compat with any
+  legacy producer that still pushes via ``writer()`` — should be
+  empty in steady state).
+
+The stream is bracketed by one run-level ``metadata`` event (§4.1)
+and one closing ``end`` event (§4.9). If graph execution raises
+before finishing, an ``error`` event is emitted with
+``recoverable:false`` and then the stream closes cleanly with
+``end`` — see README §4.8.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+
+import structlog
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph.state import CompiledStateGraph
+from pydantic import ValidationError
+
+from chimai.leader.xml_tool_call_parser import _TOOL_CALL_BLOCK_RE
+from chimai.streaming.events import CustomEnvelope
+from chimai.streaming.protocol import related_queries_ready
+
+logger = structlog.get_logger()
+
+
+# ── Envelope helpers ────────────────────────────────────────────────────
+
+
+def _ns(namespace: Tuple[Any, ...]) -> List[str]:
+    """LangGraph namespace tuple → v2 ``ns`` list of strings.
+
+    Root subgraphs emit ``namespace=()``, which maps to ``[]``.
+    Subagent subgraphs emit paths like ``("tools:abc-123",)``; we
+    stringify each element so callers don't need to worry about
+    ``NsPath`` tuples at the JSON boundary.
+    """
+    return [str(seg) for seg in namespace]
+
+
+def _derive_ns_from_metadata(
+    namespace: Tuple[Any, ...], metadata: Dict[str, Any]
+) -> Tuple[Any, ...]:
+    """Lift ``langgraph_checkpoint_ns`` into the envelope ``ns`` when empty.
+
+    ``astream(subgraphs=True)`` only surfaces a non-empty namespace
+    tuple for subgraphs registered as graph nodes via
+    :meth:`StateGraph.add_node`. The declarative sub-agent runs its
+    compiled subgraph via an inline ``.ainvoke`` from inside the
+    ``task`` tool, so the runtime has no way to wire that into
+    ``subgraphs=True``'s tuple tracking — the namespace arrives as
+    ``()`` even though the sub-agent IS a distinct subgraph.
+
+    LangGraph still creates a checkpoint namespace for that execution
+    (visible as ``metadata["langgraph_checkpoint_ns"]`` — strings like
+    ``"tools:62860c2a-..."``). Lifting it into the envelope's ``ns``
+    restores per-sub-agent visibility on the wire without requiring
+    architectural restructuring of how sub-agents are dispatched.
+
+    Rules:
+
+    - If the native ``namespace`` tuple is non-empty, trust it.
+    - Otherwise, read ``langgraph_checkpoint_ns`` from the metadata.
+      LangGraph uses ``|``-separated segments for nested subgraphs
+      (e.g. ``"tools:a|tools:b"``), so split on that.
+    - Return ``()`` (empty) for the leader-level stream — no hallucinated
+      namespace for the top graph.
+    """
+
+    if namespace:
+        return namespace
+    cns = metadata.get("langgraph_checkpoint_ns") or metadata.get("checkpoint_ns")
+    if not isinstance(cns, str) or not cns:
+        return namespace
+    segments = [seg for seg in cns.split("|") if seg]
+    return tuple(segments)
+
+
+def _sse_frame(event: str, envelope: Dict[str, Any]) -> str:
+    """Serialize one v2 envelope as an SSE frame.
+
+    The SSE spec says the payload is terminated by a blank line;
+    serializing the JSON on a single ``data:`` line keeps frames
+    robust against LF/CRLF edge cases and parses cleanly on the
+    browser side (``EventSource``).
+    """
+    body = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {body}\n\n"
+
+
+def _envelope(
+    event_type: str,
+    namespace: Tuple[Any, ...],
+    data: Any,
+    *,
+    interrupts: Optional[List[Any]] = None,
+) -> Dict[str, Any]:
+    env: Dict[str, Any] = {
+        "type": event_type,
+        "ns": _ns(namespace),
+        "data": data,
+    }
+    if event_type == "values":
+        # README §4.5 / §7 — ``interrupts`` is a sibling of ``data``.
+        env["interrupts"] = list(interrupts) if interrupts else []
+    return env
+
+
+# ── Message-chunk translation ──────────────────────────────────────────
+
+
+def _strip_xml_tool_calls(content: Any) -> Any:
+    """Remove ``<tool_call>...</tool_call>`` blocks from streamed content.
+
+    Qwen3 reasoning variants (e.g. Qwen3.6-35B-A3B served via vLLM
+    without a tool-call parser) emit tool calls as XML inside content.
+    The leader's :func:`promote_xml_tool_calls` lifts those into
+    structured ``tool_calls`` on the final ``AIMessage``, but the
+    intermediate ``AIMessageChunk`` stream still carries the raw XML
+    in ``content`` — exposing the markup to the FE. Strip it here so
+    the user never sees ``<tool_call>``-style scaffolding mid-stream.
+    """
+
+    if not isinstance(content, str) or "<tool_call>" not in content:
+        return content
+    return _TOOL_CALL_BLOCK_RE.sub("", content)
+
+
+def _serialize_message(msg: BaseMessage) -> Dict[str, Any]:
+    """Convert a LangChain message to the README §4.3/§4.4 dict shape."""
+    base: Dict[str, Any] = {
+        "id": getattr(msg, "id", None) or str(uuid.uuid4()),
+        "content": msg.content,
+    }
+    if isinstance(msg, AIMessageChunk):
+        base["type"] = "AIMessageChunk"
+        base["content"] = _strip_xml_tool_calls(base["content"])
+        if getattr(msg, "tool_calls", None):
+            base["tool_calls"] = msg.tool_calls
+        if getattr(msg, "tool_call_chunks", None):
+            base["tool_call_chunks"] = msg.tool_call_chunks
+    elif isinstance(msg, AIMessage):
+        base["type"] = "ai"
+        base["content"] = _strip_xml_tool_calls(base["content"])
+        if getattr(msg, "tool_calls", None):
+            base["tool_calls"] = msg.tool_calls
+        if getattr(msg, "usage_metadata", None):
+            base["usage_metadata"] = msg.usage_metadata
+        if getattr(msg, "response_metadata", None):
+            base["response_metadata"] = msg.response_metadata
+    elif isinstance(msg, ToolMessage):
+        base["type"] = "tool"
+        base["tool_call_id"] = getattr(msg, "tool_call_id", "") or ""
+        base["status"] = getattr(msg, "status", "success") or "success"
+    elif isinstance(msg, HumanMessage):
+        base["type"] = "human"
+    else:
+        base["type"] = getattr(msg, "type", "unknown")
+    return base
+
+
+def _serialize_metadata(md: Dict[str, Any]) -> Dict[str, Any]:
+    """Pick the subset of LangGraph run metadata the contract wants.
+
+    The README §4.2 example carries ``run_id``, ``langgraph_node``,
+    ``langgraph_step``, and ``ls_*`` fields. LangChain puts each of
+    those on the metadata dict already — we just drop anything that
+    isn't JSON-serialisable so the envelope doesn't crash the
+    serializer (Langfuse spans, Runnables, etc.).
+    """
+    safe: Dict[str, Any] = {}
+    for key, value in md.items():
+        try:
+            json.dumps(value, default=str)
+            safe[key] = value
+        except (TypeError, ValueError):
+            continue
+    return safe
+
+
+# ── Emitter ────────────────────────────────────────────────────────────
+
+
+async def stream_deep_agent_v2(
+    graph: CompiledStateGraph,
+    workflow_input: Dict[str, Any],
+    workflow_config: RunnableConfig,
+    *,
+    thread_id: str,
+    run_id: Optional[str] = None,
+    graph_id: str = "deep_agent",
+) -> AsyncIterator[str]:
+    """Drive ``graph.astream`` and yield v2 SSE frames.
+
+    Yields strings ready for an ``EventSourceResponse`` body.
+    Caller owns the HTTP lifecycle; this emitter owns the
+    envelope contract.
+    """
+    run_id_final = run_id or str(uuid.uuid4())
+
+    # README §4.1 — one run-level ``metadata`` event opens the stream.
+    yield _sse_frame(
+        "metadata",
+        _envelope(
+            "metadata",
+            (),
+            {
+                "run_id": run_id_final,
+                "thread_id": thread_id,
+                "graph_id": graph_id,
+                "created_at": datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "attempt": 1,
+            },
+        ),
+    )
+
+    # Track the last emitted ``messages/metadata`` payload per ns so
+    # we only emit it when it changes — one ``messages/metadata`` per
+    # new LLM invocation (README §4.2).
+    last_md_by_ns: Dict[Tuple[Any, ...], str] = {}
+
+    try:
+        async for chunk in graph.astream(
+            input=workflow_input,
+            config=workflow_config,
+            stream_mode=["values", "updates", "messages", "custom"],
+            subgraphs=True,
+        ):
+            # With ``subgraphs=True`` the yielded tuple is
+            # ``(namespace, stream_mode, data)``. Without it, just
+            # ``(stream_mode, data)``. We ask for subgraphs so we
+            # always have a namespace — root = ``()``.
+            if len(chunk) == 3:
+                namespace, stream_mode, data = chunk
+            else:
+                stream_mode, data = chunk
+                namespace = ()
+
+            for frame in _translate(
+                stream_mode=stream_mode,
+                data=data,
+                namespace=namespace,
+                last_md_by_ns=last_md_by_ns,
+            ):
+                yield frame
+
+    except Exception as exc:  # noqa: BLE001 — bubble every failure into the stream
+        logger.exception("deep_agent_stream_crashed", error=str(exc))
+        yield _sse_frame(
+            "error",
+            _envelope(
+                "error",
+                (),
+                {
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "recoverable": False,
+                },
+            ),
+        )
+
+    # README §4.9 — the stream always closes with ``end``. Emit it in
+    # every path (success, explicit error, external cancellation)
+    # so the client can close its EventSource cleanly.
+    yield _sse_frame("end", _envelope("end", (), {}))
+
+    # Force-flush Langfuse spans before we release the request. The
+    # default Langfuse batcher drains every ~1 s; for quick requests
+    # that leaves spans stranded in-memory when the worker recycles.
+    # Silent no-op when Langfuse isn't configured.
+    try:
+        from src.core.tracing import flush_langfuse
+
+        flush_langfuse()
+    except Exception:  # noqa: BLE001 — tracing must never break the stream
+        logger.debug("langfuse_flush_skipped", exc_info=True)
+
+
+def _translate(
+    *,
+    stream_mode: str,
+    data: Any,
+    namespace: Tuple[Any, ...],
+    last_md_by_ns: Dict[Tuple[Any, ...], str],
+) -> List[str]:
+    """Convert one ``(stream_mode, data)`` tuple to zero-or-more v2 frames."""
+    if stream_mode == "messages":
+        return _translate_messages(data, namespace, last_md_by_ns)
+    if stream_mode == "updates":
+        frames = [
+            _sse_frame(
+                "updates",
+                _envelope("updates", namespace, _jsonify(data)),
+            )
+        ]
+        frames.extend(_emit_related_queries_from_updates(data, namespace))
+        return frames
+    if stream_mode == "values":
+        payload = dict(data) if isinstance(data, dict) else {}
+        # LangGraph surfaces ``__interrupt__`` inside the values dict
+        # when the graph is paused — lift it to the envelope sibling
+        # per README §4.5 / §7.
+        interrupts = payload.pop("__interrupt__", None)
+        payload = _coerce_state_shape(payload)
+        return [
+            _sse_frame(
+                "values",
+                _envelope(
+                    "values",
+                    namespace,
+                    _jsonify(payload),
+                    interrupts=_jsonify(interrupts) if interrupts else [],
+                ),
+            )
+        ]
+    if stream_mode == "custom":
+        return [
+            _sse_frame(
+                "custom",
+                _envelope("custom", namespace, _jsonify(data)),
+            )
+        ]
+    # Unknown stream_mode: drop silently — forward-compat with
+    # future LangGraph additions.
+    return []
+
+
+def _translate_messages(
+    data: Any,
+    namespace: Tuple[Any, ...],
+    last_md_by_ns: Dict[Tuple[Any, ...], str],
+) -> List[str]:
+    """``messages`` stream → README §4.2 / §4.3 / §4.4 frames."""
+    if not isinstance(data, tuple) or len(data) != 2:
+        return []
+    message_chunk, metadata = data
+    frames: List[str] = []
+
+    md_safe = _serialize_metadata(metadata or {})
+    # Lift the checkpoint namespace into the envelope ns for every
+    # message frame in this chunk — both the metadata frame and the
+    # partial/complete frame — so a downstream consumer can group
+    # events by sub-agent without touching the metadata payload.
+    ns_effective = _derive_ns_from_metadata(namespace, md_safe)
+    md_fingerprint = json.dumps(md_safe, sort_keys=True, default=str)
+    # Key ``last_md_by_ns`` by ``ns_effective`` so sub-agent subgraphs
+    # (which share the empty native namespace) still get their own
+    # ``messages/metadata`` emitted when the LLM invocation changes.
+    if last_md_by_ns.get(ns_effective) != md_fingerprint:
+        last_md_by_ns[ns_effective] = md_fingerprint
+        frames.append(
+            _sse_frame(
+                "messages/metadata",
+                _envelope("messages/metadata", ns_effective, md_safe),
+            )
+        )
+
+    if isinstance(message_chunk, AIMessageChunk):
+        frames.append(
+            _sse_frame(
+                "messages/partial",
+                _envelope(
+                    "messages/partial",
+                    ns_effective,
+                    [_serialize_message(message_chunk)],
+                ),
+            )
+        )
+    elif isinstance(message_chunk, (ToolMessage, HumanMessage)):
+        frames.append(
+            _sse_frame(
+                "messages/complete",
+                _envelope(
+                    "messages/complete",
+                    ns_effective,
+                    [_serialize_message(message_chunk)],
+                ),
+            )
+        )
+        if isinstance(message_chunk, ToolMessage):
+            frames.extend(
+                _emit_custom_events_from_artifact(message_chunk, ns_effective)
+            )
+    # Final AIMessages are emitted via ``updates`` per README §4.6 —
+    # we deliberately do NOT turn them into messages/complete here.
+
+    return frames
+
+
+# ── Backend projectors (artifact reader + node watchers) ──────────────────
+
+
+def _emit_custom_events_from_artifact(
+    msg: ToolMessage, namespace: Tuple[Any, ...]
+) -> List[str]:
+    """Surface ``ToolMessage.artifact["custom_events"]`` as ``custom`` frames.
+
+    Tools attach pre-built ``CustomEnvelope.model_dump()`` payloads to
+    ``artifact["custom_events"]``; the projector validates each entry,
+    re-stamps it with the chunk's ``ns``, and emits one frame per
+    valid entry. Invalid entries log a warning and are dropped — a
+    misbehaving tool never breaks the stream.
+    """
+
+    artifact = getattr(msg, "artifact", None) or {}
+    if not isinstance(artifact, dict):
+        return []
+    raw_events = artifact.get("custom_events") or []
+    if not isinstance(raw_events, list):
+        return []
+
+    frames: List[str] = []
+    for raw in raw_events:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            envelope = CustomEnvelope.model_validate(raw)
+        except ValidationError as exc:
+            logger.warning(
+                "deep_agent_stream_invalid_custom_event",
+                tool_call_id=getattr(msg, "tool_call_id", None),
+                error=str(exc),
+            )
+            continue
+        body = envelope.data.model_dump(exclude_none=True, mode="json")
+        frames.append(
+            _sse_frame(
+                "custom",
+                _envelope("custom", namespace, body),
+            )
+        )
+    return frames
+
+
+def _emit_related_queries_from_updates(
+    data: Any, namespace: Tuple[Any, ...]
+) -> List[str]:
+    """Watch ``updates`` for related-queries node output → ``custom`` frame.
+
+    Matches both shapes:
+
+    - ``{"related_queries": [...]}`` (top-level — e.g. when the
+      related queries generator runs as a subgraph and merges its
+      delta directly into parent state).
+    - ``{"<node>": {"related_queries": [...]}}`` (nested — when the
+      generator is a node in the same graph).
+
+    Emits at most one ``custom: related-queries/ready`` per update.
+    """
+
+    queries = _extract_related_queries(data)
+    if not queries:
+        return []
+    envelope = related_queries_ready(queries=queries)
+    body = envelope.data.model_dump(exclude_none=True, mode="json")
+    return [
+        _sse_frame(
+            "custom",
+            _envelope("custom", namespace, body),
+        )
+    ]
+
+
+def _extract_related_queries(data: Any) -> List[str]:
+    if not isinstance(data, dict):
+        return []
+    direct = data.get("related_queries")
+    if isinstance(direct, list) and direct:
+        return [str(q) for q in direct]
+    for value in data.values():
+        if isinstance(value, dict):
+            nested = value.get("related_queries")
+            if isinstance(nested, list) and nested:
+                return [str(q) for q in nested]
+    return []
+
+
+def _coerce_state_shape(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Translate chimai's internal ``LeaderState`` to the wire shape.
+
+    The internal ``todos`` field is ``Dict[str, TodoItem]`` so the
+    harness's ``_merge_dict`` reducer can merge per-todo updates
+    across concurrent middlewares without clobbering. The README
+    §7 contract however is ``todos: list[TodoItem]`` — that's what
+    ``deep-agents-ui`` and every v2 consumer expects. Coerce at
+    the emitter boundary so the internal representation stays
+    mergeable and the external shape stays compatible.
+
+    ``files`` is already a dict in the contract (``Record<string,
+    FileEntry>``) so it passes through unchanged.
+    """
+    todos = state.get("todos")
+    if isinstance(todos, dict):
+        # Preserve the dict's id in each emitted item so the UI
+        # can reconcile across snapshots.
+        coerced: List[Dict[str, Any]] = []
+        for todo_id, todo in todos.items():
+            if not isinstance(todo, dict):
+                continue
+            item = dict(todo)
+            item.setdefault("id", todo_id)
+            coerced.append(item)
+        state = {**state, "todos": coerced}
+    return state
+
+
+def _jsonify(value: Any) -> Any:
+    """Best-effort JSON-safe coercion for nested LangChain payloads.
+
+    ``updates`` and ``values`` dicts can contain ``BaseMessage``
+    instances. The FE needs the dict form (§4.6), not a repr. We
+    walk once, converting messages on the way, and fall back to
+    ``default=str`` during the eventual ``json.dumps`` in
+    :func:`_sse_frame`.
+    """
+    if isinstance(value, BaseMessage):
+        return _serialize_message(value)
+    if isinstance(value, dict):
+        return {k: _jsonify(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonify(v) for v in value]
+    if isinstance(value, tuple):
+        return [_jsonify(v) for v in value]
+    return value
+
+
+__all__ = ["stream_deep_agent_v2"]
